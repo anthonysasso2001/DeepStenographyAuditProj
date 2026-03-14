@@ -9,6 +9,8 @@ A simple audit of "A deep learning-driven multilayered steganographic approach  
 make sure to use
 `docker build . -t tensor-gpu-docker`
 then to access
-`docker run --rm -it --gpus all -p 8888:8888  -v "$(pwd):/app" tensor-gpu-docker`
+`docker run --rm -it --gpus all -p 8888:8888 tensor-gpu-docker`
+clone into specific name to allow import to work
+`git clone https://github.com/RobinDavid/LSB-Steganography.git LSB_Steganography`
 then run below to run jupyter and allow access from vscode
 `jupyter notebook --ip=0.0.0.0 --port=8888 --no-browser --allow-root`
