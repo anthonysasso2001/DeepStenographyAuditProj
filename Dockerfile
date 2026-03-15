@@ -9,12 +9,12 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # 3. Install python packages
 # Note: Using pip3 specifically for Ubuntu
 RUN pip3 install --no-cache-dir \
-    git \
     jupyter \
     tensorflow['and-cuda'] \
     opencv-python-headless \
