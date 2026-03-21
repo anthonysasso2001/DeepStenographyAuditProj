@@ -1,0 +1,10 @@
+jupyter
+tensorflow[and-cuda]
+opencv-python-headless
+docopt
+matplotlib
+numpy
+dahuffman
+datasets
+pydot
+python-dotenv

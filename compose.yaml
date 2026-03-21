@@ -1,0 +1,15 @@
+services:
+  jupyterContainer:
+    image: steganography-audit
+    ports:
+      - "8888:8888"
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    volumes:
+      - .:/app # Mount a local 'notebooks' folder
+      - ./jupyter_notebook_config.py:/root/.jupyter/jupyter_notebook_config.py
+    working_dir: /app
+    env_file:
+      - .env
+    command: jupyter notebook --config=/root/.jupyter/jupyter_notebook_config.py --no-browser

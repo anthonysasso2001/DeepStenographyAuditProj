@@ -1,5 +1,5 @@
 # Use a versioned base image for stability (instead of :latest)
-FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
+FROM tensorflow/tensorflow:latest-gpu-jupyter
 
 
 # 2. Install python and system dependencies
@@ -13,16 +13,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY requirements.txt /app/
 COPY . /app
 
 # 3. Install python packages
-# Note: Using pip3 specifically for Ubuntu
-RUN pip3 install --no-cache-dir jupyter \
-    tensorflow['and-cuda'] \
-    opencv-python-headless \
-    docopt \
-    matplotlib \
-    numpy \
-    dahuffman \
-    datasets \
-    pydot
+# Upgrade pip first, then install from requirements.txt
+RUN python3 -m pip install --upgrade pip && \
+    python3 -m pip install --no-cache-dir -r requirements.txt
