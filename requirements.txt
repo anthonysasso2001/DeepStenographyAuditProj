@@ -8,3 +8,5 @@ dahuffman
 datasets
 pydot
 python-dotenv
+scikit-learn
+ipython

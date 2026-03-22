@@ -1,4 +1,4 @@
-# Jupyter Notebook configuration file
+# Jupyter Server configuration file
 # This file sets up persistent authentication for Jupyter
 import os
 from dotenv import load_dotenv
@@ -10,19 +10,26 @@ c = get_config()  # noqa
 
 # Set a persistent token from environment variable
 jupyter_token = os.getenv('JUPYTER_TOKEN', 'backup-token-9E5DEDB0656AF1D525D2C003604D0FCA0EC')
-c.NotebookApp.token = jupyter_token
+c.ServerApp.token = jupyter_token
 
 # Disable password authentication since we're using token
-c.NotebookApp.password = ''
+c.ServerApp.password = ''
 
 # Allow root user (needed for Docker)
-c.NotebookApp.allow_root = True
+c.ServerApp.allow_root = True
 
 # Bind to all interfaces
-c.NotebookApp.ip = '0.0.0.0'
+c.ServerApp.ip = '0.0.0.0'
 
 # Port configuration
-c.NotebookApp.port = 8888
+c.ServerApp.port = 8888
 
-# Disable token requirement in URL when using --ip=0.0.0.0
-c.NotebookApp.token_expiry = 0  # Token never expires
+# Token never expires
+c.ServerApp.token_expiry = 0
+
+# Use consistent user for token-authenticated requests (fixes ephemeral user generation)
+c.ServerApp.authenticate_via_token_only = True
+c.ServerApp.user = 'jupyter'
+
+# Enable verbose logging to see connection details
+c.ServerApp.log_level = 'DEBUG'

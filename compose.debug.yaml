@@ -13,3 +13,10 @@ services:
     env_file:
       - .env
     command: jupyter notebook --config=/root/.jupyter/jupyter_notebook_config.py --no-browser
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
