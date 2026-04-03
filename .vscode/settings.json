@@ -1,0 +1,14 @@
+{
+  "files.exclude": {
+    "checkpoints/": true,
+    "models/": true
+  },
+  "search.exclude": {
+    "checkpoints/": true,
+    "models/": true
+  },
+  "files.watcherExclude": {
+    "/checkpoints/": true,
+    "/models/": true
+  }
+}
