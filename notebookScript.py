@@ -7,10 +7,10 @@ from IPython.display import display
 from nltk.corpus import words
 import nltk
 from tqdm.auto import tqdm
-import pandas as pd
-from plotly.subplots import make_subplots
-import plotly.graph_objects as go
 import shutil
+from plotly.subplots import make_subplots
+import pandas as pd
+import plotly.graph_objects as go
 import pywt
 from scipy import fft
 from reedsolo import RSCodec
@@ -25,6 +25,7 @@ from datasets import load_dataset
 import numpy as np
 import os
 import tensorflow as tf
+import gc
 
 # NOTE: may have to change batch size and epochs depending on GPU VRAM. but epochs should be kept to 100 if possible for train accuracy.
 # dataset vars
@@ -38,22 +39,47 @@ PAD_CHAR = "\x00"
 # training vars
 CLEAR_BEFORE_TRAIN = True
 BATCH_SIZE = 64
-EPOCHS = 25
-LEARNING_RATE = 1e-3
 STEPS = TRAIN_END//2 // BATCH_SIZE + 1
-ALPHA = 1.0
-BETA = 5.0
-RS_BYTES = 32
-# when to start, finish ramp, and std of noise in training loop to improve resilience
-START_NOISE_EP = 20
-PEAK_NOISE_EP = 50
+# Each dict defines one ablation run. Keys override the scalar defaults above.
+ABLATION_CONFIGS = [
+    # idx 0 — baseline: reference point, noise ramps in at halfway
+    # Expected: solid all-round concealment + recovery
+    {"BETA": 5.0, "ALPHA": 1.0, "EPOCHS": 50, "LEARNING_RATE": 1e-3,
+     "START_NOISE_EP": 25, "PEAK_NOISE_EP": 50, "RS_BYTES": 32},
+
+    # idx 1 — concealment-focused: high beta + late noise + moderate RS
+    # Hypothesis: network learns clean hiding first, noise comes late;
+    # should yield best PSNR / SSIM on cover with acceptable BER
+    {"BETA": 8.0, "ALPHA": 1.0, "EPOCHS": 50, "LEARNING_RATE": 1e-3,
+     "START_NOISE_EP": 30, "PEAK_NOISE_EP": 50, "RS_BYTES": 32},
+
+    # idx 2 — recovery-focused: lower beta + higher alpha + high RS
+    # Hypothesis: heavier reveal loss + 64-byte ECC = best text accuracy / BER
+    {"BETA": 3.0, "ALPHA": 2.0, "EPOCHS": 50, "LEARNING_RATE": 1e-3,
+     "START_NOISE_EP": 25, "PEAK_NOISE_EP": 50, "RS_BYTES": 64},
+
+    # idx 3 — robustness-first: early noise + high RS
+    # Hypothesis: aggressive noise from ep 5 forces robust hiding;
+    # RS64 compensates for the harder learning signal
+    {"BETA": 5.0, "ALPHA": 1.0, "EPOCHS": 50, "LEARNING_RATE": 1e-3,
+     "START_NOISE_EP": 5, "PEAK_NOISE_EP": 25, "RS_BYTES": 64},
+
+    # idx 4 — slow & stable: halved LR + cosine decay over 50 ep
+    # Hypothesis: fine-grained convergence improves both losses jointly
+    {"BETA": 5.0, "ALPHA": 1.0, "EPOCHS": 50, "LEARNING_RATE": 5e-4,
+     "START_NOISE_EP": 25, "PEAK_NOISE_EP": 50, "RS_BYTES": 32},
+
+    # idx 5 — no noise, high RS: clean training signal, ECC does the work
+    # Hypothesis: without noise the model perfectly hides; RS64 recovers text;
+    # sets an upper-bound on imperceptibility
+    {"BETA": 5.0, "ALPHA": 1.0, "EPOCHS": 50, "LEARNING_RATE": 1e-3,
+     "START_NOISE_EP": 999, "PEAK_NOISE_EP": 999, "RS_BYTES": 64},
+]
+
 # Define your checkpoint directory
 checkpoint_dir = './checkpoints/'
 models_dir = './models/'
 data_dir = './data/'
-prep_model_path = os.path.join(models_dir, 'prep_model.keras')
-hide_model_path = os.path.join(models_dir, 'hide_model.keras')
-reveal_model_path = os.path.join(models_dir, 'reveal_model.keras')
 
 
 # %%
@@ -218,22 +244,6 @@ def build_stable_branch(inputs, kernel_size, name_prefix):
 
     return x
 
-# possible option for hide and maybe prep to
-
-
-def build_residual_branch(inputs, kernel_size, name_prefix):
-    shortcut = inputs
-    x = inputs
-    for i in range(4):
-        x = layers.Conv2D(50, kernel_size, padding='same', activation='relu',
-                          kernel_initializer=initializer, bias_initializer='zeros',
-                          name=f'{name_prefix}_{i+1}')(x)
-    if shortcut.shape[-1] != 50:
-        shortcut = layers.Conv2D(50, (1, 1), padding='same',
-                                 kernel_initializer=initializer,
-                                 name=f'{name_prefix}_proj')(shortcut)
-    return layers.Add(name=f'{name_prefix}_add')([x, shortcut])
-
 
 def build_keras_prep_network(input_shape=(64, 64, 3)):
     inputs = layers.Input(shape=input_shape, name="secret_image")
@@ -264,7 +274,6 @@ def build_keras_prep_network(input_shape=(64, 64, 3)):
     return Model(inputs=inputs, outputs=outputs, name="Keras_PrepNetwork")
 
 
-# %%
 def build_keras_hide_network(input_shape=(64, 64, 3), prep_channels=150):
     # Inputs
     cover_input = layers.Input(shape=input_shape, name="cover_input")
@@ -305,7 +314,6 @@ def build_keras_hide_network(input_shape=(64, 64, 3), prep_channels=150):
     return Model(inputs=[cover_input, prep_input], outputs=output, name="Keras_HideNetwork")
 
 
-# %%
 def build_keras_reveal_network(input_shape=(64, 64, 3)):
     stego_input = layers.Input(shape=input_shape, name="stego_input")
 
@@ -337,10 +345,6 @@ def build_keras_reveal_network(input_shape=(64, 64, 3)):
 
 
 # %%
-
-prep_network = build_keras_prep_network()
-hide_network = build_keras_hide_network()
-reveal_network = build_keras_reveal_network()
 
 
 def steganography_loss(cover_input, secret_input, cover_output, secret_output, alpha=1.0, beta=10.0):
@@ -1304,7 +1308,6 @@ def plot_steganography_graph(
     )
 
 
-# %%
 class SaveEveryTen(tf.keras.callbacks.Callback):
     def __init__(self, checkpoint_dir, max_to_keep=3):
         super().__init__()
@@ -1343,308 +1346,338 @@ class SaveEveryTen(tf.keras.callbacks.Callback):
                 os.remove(path)
 
 
-# Create the integrated model
-lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
-    initial_learning_rate=LEARNING_RATE,
-    decay_steps=EPOCHS * STEPS,  # Total number of training steps
-    alpha=0.01
-)
+def save_history_and_plot(history, data_dir):
+    hist_dict = history.history if hasattr(history, 'history') else history
 
-optimizer = tf.keras.optimizers.Adam(
-    learning_rate=lr_schedule,
-    global_clipnorm=1.0
-)
+    # Save to CSV
+    filename = os.path.join(data_dir, 'training_history.csv')
+    df = pd.DataFrame(hist_dict)
+    df.index.name = 'epoch'
+    df.to_csv(filename)
 
+    epochs = list(range(1, len(next(iter(hist_dict.values()))) + 1))
 
-# Wrap it for your StegoSystem
-tools = {
-    'codec': codec,
-    # Ensure keys match your 'methods' list
-    **stego_map
-}
+    # Create 3 subplots
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=(
+            "Loss Convergence (Detailed)",
+            "Fidelity: Cover PSNR & Secret SSIM",
+            "Schedules: LR & Noise Prob",
+            "Payload vs Loss Relationship"
+        ),
+        horizontal_spacing=0.1,
+        vertical_spacing=0.15,
+        specs=[
+            [{"secondary_y": False}, {"secondary_y": True}],
+            [{"secondary_y": True}, {"secondary_y": False}]
+        ]
+    )
 
-model = StegoSystem(
-    prep_net=prep_network,
-    hide_net=hide_network,
-    reveal_net=reveal_network,
-    stego_tools=tools,
-    steps_per_epoch=STEPS,
-    max_safe_chars=max_safe_word_len,
-    alpha=ALPHA,
-    beta=BETA,
-    noise_start_epoch=START_NOISE_EP,
-    noise_peak_epoch=PEAK_NOISE_EP
-)
+    # --- Panel 1: Losses with High Contrast & Fills ---
+    # Total Loss (primary)
+    fig.add_trace(go.Scatter(
+        x=epochs, y=hist_dict['loss'],
+        name="Train Total Loss",
+        line=dict(color='#1f77b4', width=3),
+        fill='tozeroy',
+        fillcolor='rgba(31, 119, 180, 0.1)'
+    ), row=1, col=1)
 
-model.build([(None, 64, 64, 3), (None, 64, 64, 3)])
-model.compile(optimizer=optimizer, jit_compile=False)
-# Execute the plot
-model.summary()
-plot_steganography_graph("steganography_logical_flow.pdf", False, 300, False)
-plot_steganography_graph("steganography_nested_flow.pdf", True, 300, False)
-plot_steganography_graph("steganography_full_flow.pdf", True, 300, True)
-# Callback to save every 10 epochs
-checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
-    filepath='checkpoints/stego_best_val.weights.h5',
-    monitor='val_loss',
-    save_best_only=True,
-    save_weights_only=True,
-    verbose=1,
-)
+    # Validation Loss
+    if 'val_loss' in hist_dict:
+        fig.add_trace(go.Scatter(
+            x=epochs, y=hist_dict['val_loss'],
+            name="Val Total Loss",
+            line=dict(color='#1f77b4', width=2, dash='dash')
+        ), row=1, col=1)
 
+    # Cover loss
+    fig.add_trace(go.Scatter(
+        x=epochs, y=hist_dict['cover_loss'],
+        name="Cover Loss",
+        line=dict(color='#d62728', width=2, dash='dash')
+    ), row=1, col=1)
 
-callbacks = [checkpoint_callback,
-             SaveEveryTen(checkpoint_dir=checkpoint_dir, max_to_keep=3),
+    # Secret loss
+    fig.add_trace(go.Scatter(
+        x=epochs, y=hist_dict['secret_loss'],
+        name="Secret Loss",
+        line=dict(color='#2ca02c', width=2, dash='dot')
+    ), row=1, col=1)
 
-             ]
+    # --- Panel 2: Fidelity (PSNR & SSIM) ---
+    # --- PSNR (Purple family) ---
+    if 'cover_psnr' in hist_dict:
+        fig.add_trace(go.Scatter(
+            x=epochs, y=hist_dict['cover_psnr'],
+            name="Train PSNR",
+            line=dict(color='#9467bd', width=4)
+        ), row=1, col=2, secondary_y=False)
 
-# Train using Keras Fit
-history = model.fit(
-    train_dataset,
-    epochs=EPOCHS,
-    validation_data=test_dataset,
-    callbacks=callbacks,
-    verbose=1
-)
+    if 'val_cover_psnr' in hist_dict:
+        fig.add_trace(go.Scatter(
+            x=epochs, y=hist_dict['val_cover_psnr'],
+            name="Val PSNR",
+            line=dict(color='#9467bd', width=2, dash='dash')
+        ), row=1, col=2, secondary_y=False)
 
+    # --- SSIM (Black family) ---
+    if 'secret_ssim' in hist_dict:
+        fig.add_trace(go.Scatter(
+            x=epochs, y=hist_dict['secret_ssim'],
+            name="Train SSIM",
+            line=dict(color='#111111', width=3)
+        ), row=1, col=2, secondary_y=True)
 
-model.prep_net.save(prep_model_path)
-model.hide_net.save(hide_model_path)
-model.reveal_net.save(reveal_model_path)
-print("Training completed.Final model states saved.")
+    if 'val_secret_ssim' in hist_dict:
+        fig.add_trace(go.Scatter(
+            x=epochs, y=hist_dict['val_secret_ssim'],
+            name="Val SSIM",
+            line=dict(color='#111111', width=2, dash='dot')
+        ), row=1, col=2, secondary_y=True)
 
-results = model.evaluate(test_dataset)
-print(
-    f"Validation Results - Total Loss: {results[0]:.4f}, Cover Loss: {results[1]:.4f}, Secret Loss: {results[2]:.4f}")
+    methods = ['lsb', 'dct', 'dwt', 'spread_spectrum', 'statistical']
+    method_colors = {
+        'lsb': '#4C78A8',
+        'dct': '#F58518',
+        'dwt': '#54A24B',
+        'spread_spectrum': '#E45756',
+        'statistical': '#B279A2'
+    }
+
+    # PSNR per method
+    for m in methods:
+        key = f'psnr_{m}'
+        if key in hist_dict:
+            fig.add_trace(go.Scatter(
+                x=epochs,
+                y=hist_dict[key],
+                name=f"PSNR ({m})",
+                line=dict(color=method_colors[m], width=1.5, dash='dot'),
+                opacity=0.6
+            ), row=1, col=2, secondary_y=False)
+
+    # SSIM per method
+    for m in methods:
+        key = f'ssim_{m}'
+        if key in hist_dict:
+            fig.add_trace(go.Scatter(
+                x=epochs,
+                y=hist_dict[key],
+                name=f"SSIM ({m})",
+                line=dict(color=method_colors[m], width=1.5, dash='longdash'),
+                opacity=0.6
+            ), row=1, col=2, secondary_y=True)
+
+    # --- Panel 3: Schedules ---
+    # Learning rate (yellow)
+    if 'lr' in hist_dict:
+        fig.add_trace(go.Scatter(
+            x=epochs, y=hist_dict['lr'],
+            name="LR",
+            line=dict(color='#f2c94c', width=2)
+        ), row=2, col=1, secondary_y=False)
+
+    # Noise probability (green)
+    if 'noise_prob' in hist_dict:
+        fig.add_trace(go.Scatter(
+            x=epochs, y=hist_dict['noise_prob'],
+            name="Noise Prob",
+            line=dict(color='#27ae60', width=3),
+            fill='tozeroy',
+            fillcolor='rgba(39, 174, 96, 0.2)'
+        ), row=2, col=1, secondary_y=True)
+
+    # Payload (pink)
+    # if 'payload_len' in hist_dict:
+    #     fig.add_trace(go.Scatter(
+    #         x=epochs, y=hist_dict['payload_len'],
+    #         name="Payload Length",
+    #         line=dict(color='#ff4da6', width=2, dash='dot')
+    #     ), row=2, col=1, secondary_y=True)
+
+    # if 'embed_success' in hist_dict:
+    #     fig.add_trace(go.Scatter(
+    #         x=epochs, y=hist_dict['embed_success'],
+    #         name="Embed Success",
+    #         line=dict(color='#00a896', width=2)
+    #     ), row=2, col=1, secondary_y=True)
+
+    # for m in methods:
+    #     key = f'embed_success_{m}'
+    #     if key in hist_dict:
+    #         fig.add_trace(go.Scatter(
+    #             x=epochs, y=hist_dict[key],
+    #             name=f"Embed Success ({m})",
+    #             line=dict(color=method_colors[m], width=1.2, dash='dash'),
+    #             opacity=0.55
+    #         ), row=2, col=1, secondary_y=True)
+
+    # --- Panel 3: Payload Scatterplot ---
+    # if 'payload_len' in hist_dict:
+    #     fig.add_trace(go.Scatter(
+    #         x=hist_dict['payload_len'],
+    #         y=hist_dict['loss'],
+    #         mode='markers',
+    #         name="Loss vs Payload (epoch)",
+    #         marker=dict(
+    #             size=7,
+    #             color=epochs,
+    #             colorscale='Turbo',  # better than Viridis for progression
+    #             showscale=True,
+    #             colorbar=dict(title="Epoch")
+    #         )
+    #     ), row=2, col=2)
+
+    # --- Formatting ---
+    # Panel 1
+    fig.update_yaxes(title_text="Loss (MSE)", row=1, col=1)
+
+    # Panel 2
+    fig.update_yaxes(title_text="PSNR (dB)", range=[
+        10, 50], row=1, col=2, secondary_y=False)
+    fig.update_yaxes(title_text="SSIM", range=[
+        0, 1.05], row=1, col=2, secondary_y=True)
+
+    # Panel 3
+    fig.update_yaxes(type="log", title_text="LR (Log)",
+                     row=2, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="Noise Prob / Payload",
+                     range=[0, 1.05], row=2, col=1, secondary_y=True)
+
+    # Panel 4
+    fig.update_xaxes(title_text="Payload Length (chars)", row=2, col=2)
+    fig.update_yaxes(title_text="Total Loss", row=2, col=2)
+
+    for col, row in [(1, 1), (1, 2), (2, 1)]:
+        fig.add_vline(
+            x=START_NOISE_EP,
+            line_dash="dash",
+            line_color="gray",
+            annotation_text="Noise Start",
+            annotation_position="top left",
+            row=1, col=1
+        )
+
+    fig.update_layout(
+        height=550, width=1800,
+        title_text="Steganography Model Audit: Multitask Convergence vs. Fidelity",
+        template="plotly_white",
+        hovermode="x unified",  # Shows all values in one tooltip when hovering
+        legend=dict(orientation="h", yanchor="bottom",
+                    y=1.02, xanchor="right", x=1)
+    )
+
+    pdf_path = os.path.join(data_dir, "training_plot.pdf")
+    fig.write_image(pdf_path, format="pdf", width=1800, height=550)
+    fig.show()
 
 
 # %%
 
-hist_dict = history.history if hasattr(history, 'history') else history
 
-# Save to CSV
-filename = os.path.join(data_dir, 'training_history.csv')
-df = pd.DataFrame(hist_dict)
-df.index.name = 'epoch'
-df.to_csv(filename)
+for ablation_idx in range(len(ABLATION_CONFIGS)):
+    _cfg = ABLATION_CONFIGS[ablation_idx]
+    BETA = _cfg["BETA"]
+    ALPHA = _cfg["ALPHA"]
+    EPOCHS = _cfg["EPOCHS"]
+    LEARNING_RATE = _cfg["LEARNING_RATE"]
+    START_NOISE_EP = _cfg["START_NOISE_EP"]
+    PEAK_NOISE_EP = _cfg["PEAK_NOISE_EP"]
+    RS_BYTES = _cfg["RS_BYTES"]
 
-epochs = list(range(1, len(next(iter(hist_dict.values()))) + 1))
+    # Fresh network weights for every run — prevents weight leakage between ablations
+    prep_network = build_keras_prep_network()
+    hide_network = build_keras_hide_network()
+    reveal_network = build_keras_reveal_network()
 
-# Create 3 subplots
-fig = make_subplots(
-    rows=2, cols=2,
-    subplot_titles=(
-        "Loss Convergence (Detailed)",
-        "Fidelity: Cover PSNR & Secret SSIM",
-        "Schedules: LR & Noise Prob",
-        "Payload vs Loss Relationship"
-    ),
-    horizontal_spacing=0.1,
-    vertical_spacing=0.15,
-    specs=[
-        [{"secondary_y": False}, {"secondary_y": True}],
-        [{"secondary_y": True}, {"secondary_y": False}]
-    ]
-)
+    # Per-run output directories
+    run_ckpt_dir = os.path.join(checkpoint_dir, str(ablation_idx))
+    run_models_dir = os.path.join(models_dir, str(ablation_idx))
+    run_data_dir = os.path.join(data_dir, str(ablation_idx))
+    for _d in (run_ckpt_dir, run_models_dir, run_data_dir):
+        os.makedirs(_d, exist_ok=True)
 
-# --- Panel 1: Losses with High Contrast & Fills ---
-# Total Loss (primary)
-fig.add_trace(go.Scatter(
-    x=epochs, y=hist_dict['loss'],
-    name="Train Total Loss",
-    line=dict(color='#1f77b4', width=3),
-    fill='tozeroy',
-    fillcolor='rgba(31, 119, 180, 0.1)'
-), row=1, col=1)
-
-# Validation Loss
-if 'val_loss' in hist_dict:
-    fig.add_trace(go.Scatter(
-        x=epochs, y=hist_dict['val_loss'],
-        name="Val Total Loss",
-        line=dict(color='#1f77b4', width=2, dash='dash')
-    ), row=1, col=1)
-
-# Cover loss
-fig.add_trace(go.Scatter(
-    x=epochs, y=hist_dict['cover_loss'],
-    name="Cover Loss",
-    line=dict(color='#d62728', width=2, dash='dash')
-), row=1, col=1)
-
-# Secret loss
-fig.add_trace(go.Scatter(
-    x=epochs, y=hist_dict['secret_loss'],
-    name="Secret Loss",
-    line=dict(color='#2ca02c', width=2, dash='dot')
-), row=1, col=1)
-
-# --- Panel 2: Fidelity (PSNR & SSIM) ---
-# --- PSNR (Purple family) ---
-if 'cover_psnr' in hist_dict:
-    fig.add_trace(go.Scatter(
-        x=epochs, y=hist_dict['cover_psnr'],
-        name="Train PSNR",
-        line=dict(color='#9467bd', width=4)
-    ), row=1, col=2, secondary_y=False)
-
-if 'val_cover_psnr' in hist_dict:
-    fig.add_trace(go.Scatter(
-        x=epochs, y=hist_dict['val_cover_psnr'],
-        name="Val PSNR",
-        line=dict(color='#9467bd', width=2, dash='dash')
-    ), row=1, col=2, secondary_y=False)
-
-# --- SSIM (Black family) ---
-if 'secret_ssim' in hist_dict:
-    fig.add_trace(go.Scatter(
-        x=epochs, y=hist_dict['secret_ssim'],
-        name="Train SSIM",
-        line=dict(color='#111111', width=3)
-    ), row=1, col=2, secondary_y=True)
-
-if 'val_secret_ssim' in hist_dict:
-    fig.add_trace(go.Scatter(
-        x=epochs, y=hist_dict['val_secret_ssim'],
-        name="Val SSIM",
-        line=dict(color='#111111', width=2, dash='dot')
-    ), row=1, col=2, secondary_y=True)
-
-methods = ['lsb', 'dct', 'dwt', 'spread_spectrum', 'statistical']
-method_colors = {
-    'lsb': '#4C78A8',
-    'dct': '#F58518',
-    'dwt': '#54A24B',
-    'spread_spectrum': '#E45756',
-    'statistical': '#B279A2'
-}
-
-# PSNR per method
-for m in methods:
-    key = f'psnr_{m}'
-    if key in hist_dict:
-        fig.add_trace(go.Scatter(
-            x=epochs,
-            y=hist_dict[key],
-            name=f"PSNR ({m})",
-            line=dict(color=method_colors[m], width=1.5, dash='dot'),
-            opacity=0.6
-        ), row=1, col=2, secondary_y=False)
-
-# SSIM per method
-for m in methods:
-    key = f'ssim_{m}'
-    if key in hist_dict:
-        fig.add_trace(go.Scatter(
-            x=epochs,
-            y=hist_dict[key],
-            name=f"SSIM ({m})",
-            line=dict(color=method_colors[m], width=1.5, dash='longdash'),
-            opacity=0.6
-        ), row=1, col=2, secondary_y=True)
-
-# --- Panel 3: Schedules ---
-# Learning rate (yellow)
-if 'lr' in hist_dict:
-    fig.add_trace(go.Scatter(
-        x=epochs, y=hist_dict['lr'],
-        name="LR",
-        line=dict(color='#f2c94c', width=2)
-    ), row=2, col=1, secondary_y=False)
-
-# Noise probability (green)
-if 'noise_prob' in hist_dict:
-    fig.add_trace(go.Scatter(
-        x=epochs, y=hist_dict['noise_prob'],
-        name="Noise Prob",
-        line=dict(color='#27ae60', width=3),
-        fill='tozeroy',
-        fillcolor='rgba(39, 174, 96, 0.2)'
-    ), row=2, col=1, secondary_y=True)
-
-# Payload (pink)
-# if 'payload_len' in hist_dict:
-#     fig.add_trace(go.Scatter(
-#         x=epochs, y=hist_dict['payload_len'],
-#         name="Payload Length",
-#         line=dict(color='#ff4da6', width=2, dash='dot')
-#     ), row=2, col=1, secondary_y=True)
-
-# if 'embed_success' in hist_dict:
-#     fig.add_trace(go.Scatter(
-#         x=epochs, y=hist_dict['embed_success'],
-#         name="Embed Success",
-#         line=dict(color='#00a896', width=2)
-#     ), row=2, col=1, secondary_y=True)
-
-# for m in methods:
-#     key = f'embed_success_{m}'
-#     if key in hist_dict:
-#         fig.add_trace(go.Scatter(
-#             x=epochs, y=hist_dict[key],
-#             name=f"Embed Success ({m})",
-#             line=dict(color=method_colors[m], width=1.2, dash='dash'),
-#             opacity=0.55
-#         ), row=2, col=1, secondary_y=True)
-
-# --- Panel 3: Payload Scatterplot ---
-# if 'payload_len' in hist_dict:
-#     fig.add_trace(go.Scatter(
-#         x=hist_dict['payload_len'],
-#         y=hist_dict['loss'],
-#         mode='markers',
-#         name="Loss vs Payload (epoch)",
-#         marker=dict(
-#             size=7,
-#             color=epochs,
-#             colorscale='Turbo',  # better than Viridis for progression
-#             showscale=True,
-#             colorbar=dict(title="Epoch")
-#         )
-#     ), row=2, col=2)
-
-# --- Formatting ---
-# Panel 1
-fig.update_yaxes(title_text="Loss (MSE)", row=1, col=1)
-
-# Panel 2
-fig.update_yaxes(title_text="PSNR (dB)", range=[
-                 10, 50], row=1, col=2, secondary_y=False)
-fig.update_yaxes(title_text="SSIM", range=[
-                 0, 1.05], row=1, col=2, secondary_y=True)
-
-# Panel 3
-fig.update_yaxes(type="log", title_text="LR (Log)",
-                 row=2, col=1, secondary_y=False)
-fig.update_yaxes(title_text="Noise Prob / Payload",
-                 range=[0, 1.05], row=2, col=1, secondary_y=True)
-
-# Panel 4
-fig.update_xaxes(title_text="Payload Length (chars)", row=2, col=2)
-fig.update_yaxes(title_text="Total Loss", row=2, col=2)
-
-for col, row in [(1, 1), (1, 2), (2, 1)]:
-    fig.add_vline(
-        x=START_NOISE_EP,
-        line_dash="dash",
-        line_color="gray",
-        annotation_text="Noise Start",
-        annotation_position="top left",
-        row=1, col=1
+    # Create the integrated model
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+        initial_learning_rate=LEARNING_RATE,
+        decay_steps=EPOCHS * STEPS,  # Total number of training steps
+        alpha=0.01
     )
 
-fig.update_layout(
-    height=550, width=1800,
-    title_text="Steganography Model Audit: Multitask Convergence vs. Fidelity",
-    template="plotly_white",
-    hovermode="x unified",  # Shows all values in one tooltip when hovering
-    legend=dict(orientation="h", yanchor="bottom",
-                y=1.02, xanchor="right", x=1)
-)
+    optimizer = tf.keras.optimizers.Adam(
+        learning_rate=lr_schedule,
+        global_clipnorm=1.0
+    )
 
-pdf_path = os.path.join(data_dir, "training_plot.pdf")
-fig.write_image(pdf_path, format="pdf", width=1800, height=550)
-fig.show()
+    # Wrap it for your StegoSystem
+    tools = {
+        'codec': codec,
+        # Ensure keys match your 'methods' list
+        **stego_map
+    }
+
+    model = StegoSystem(
+        prep_net=prep_network,
+        hide_net=hide_network,
+        reveal_net=reveal_network,
+        stego_tools=tools,
+        steps_per_epoch=STEPS,
+        max_safe_chars=max_safe_word_len,
+        alpha=ALPHA,
+        beta=BETA,
+        noise_start_epoch=START_NOISE_EP,
+        noise_peak_epoch=PEAK_NOISE_EP
+    )
+
+    model.build([(None, 64, 64, 3), (None, 64, 64, 3)])
+    model.compile(optimizer=optimizer, jit_compile=False)
+    # Execute the plot but only on first ablation cause they won't be different logically
+    if ablation_idx == 0:
+        model.summary()
+        plot_steganography_graph(
+            "steganography_logical_flow.pdf", False, 300, False)
+        plot_steganography_graph(
+            "steganography_nested_flow.pdf", True, 300, False)
+        plot_steganography_graph(
+            "steganography_full_flow.pdf", True, 300, True)
+    # Callback to save every 10 epochs
+    checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
+        filepath=os.path.join(run_ckpt_dir, 'stego_best_val.weights.h5'),
+        monitor='val_loss',
+        save_best_only=True,
+        save_weights_only=True,
+        verbose=1,
+    )
+
+    callbacks = [checkpoint_callback,
+                 SaveEveryTen(checkpoint_dir=run_ckpt_dir, max_to_keep=3),
+
+                 ]
+
+    # Train using Keras Fit
+    history = model.fit(
+        train_dataset,
+        epochs=EPOCHS,
+        validation_data=test_dataset,
+        callbacks=callbacks,
+        verbose=1
+    )
+
+    model.prep_net.save(os.path.join(run_models_dir, 'prep_model.keras'))
+    model.hide_net.save(os.path.join(run_models_dir, 'hide_model.keras'))
+    model.reveal_net.save(os.path.join(run_models_dir, 'reveal_model.keras'))
+    print("Training completed. Final model states saved.")
+
+    results = model.evaluate(test_dataset)
+    print(
+        f"Validation Results - Total Loss: {results[0]:.4f}, Cover Loss: {results[1]:.4f}, Secret Loss: {results[2]:.4f}")
+    save_history_and_plot(history, run_data_dir)
+
+    del model
+    tf.keras.backend.clear_session()
+    gc.collect()
 
 
 # %% [markdown]
@@ -1654,8 +1687,6 @@ fig.show()
 #
 
 # %%
-
-
 def calculate_text_ber(original_text, revealed_text):
     """
     Calculates the Bit Error Rate between two strings.
@@ -1709,8 +1740,6 @@ def calculate_img_ber(original, revealed):
     total_bits = orig_bits.size
 
     return mismatched_bits / total_bits
-
-# Calculate Text Accuracy (Fixing the shadowed 'i' variable)
 
 
 def acc_txt(secret, revealed):
@@ -1792,18 +1821,20 @@ def check_audit_viability(text, codec, stego_objects, image_shape=(64, 64, 3), r
     print("-" * 60)
 
 
-def load_weights_from_checkpoint(models_dir, prep_net, hide_net, reveal_net):
-
+def load_weights_from_checkpoint(models_dir):
+    _prep = os.path.join(models_dir, 'prep_model.keras')
+    _hide = os.path.join(models_dir, 'hide_model.keras')
+    _reveal = os.path.join(models_dir, 'reveal_model.keras')
     # Verify all files exist before attempting to load
-    if not all(os.path.exists(p) for p in [prep_model_path, hide_model_path, reveal_model_path]):
+    if not all(os.path.exists(p) for p in [_prep, _hide, _reveal]):
         raise FileNotFoundError(
             f"⛔ CRITICAL: One or more .keras files not found in {models_dir}. "
             "Ensure you have run the individual .save() commands first."
         )
 
-    prep_net = tf.keras.models.load_model(prep_model_path)
-    hide_net = tf.keras.models.load_model(hide_model_path)
-    reveal_net = tf.keras.models.load_model(reveal_model_path)
+    prep_net = tf.keras.models.load_model(_prep)
+    hide_net = tf.keras.models.load_model(_hide)
+    reveal_net = tf.keras.models.load_model(_reveal)
     print(f"💎 Individual weights successfully loaded from {models_dir}")
     return prep_net, hide_net, reveal_net
 
@@ -1964,26 +1995,6 @@ def plot_final_summary(metrics_list, save_path):
 
 # %%
 
-# reload just to check saved model works, and so this can be run without fit if needed.
-prep_network, hide_network, reveal_network = load_weights_from_checkpoint(
-    models_dir, prep_network, hide_network, reveal_network
-)
-
-
-all_metrics = []
-
-
-mse_handler = tf.keras.losses.MeanSquaredError()
-methods = ['original'] + [k.lower() for k in stego_map.keys()]
-
-num_samples = 5  # len(holdout_dataset)
-print(f"Evaluating {num_samples} samples...")
-
-
-sample_dataset = holdout_dataset.take(num_samples)
-pbar = tqdm(enumerate(sample_dataset), total=num_samples,
-            desc="Audit Progress", unit="img")
-
 try:
     word_list = words.words()
 except:
@@ -1991,16 +2002,6 @@ except:
     # need to reimport if not downloaded
     from nltk.corpus import words
     word_list = [w.lower() for w in words.words() if w.isalpha()]
-
-# Filter for medium-length words to ensure they fit your codec capacity
-max_word, max_char_len = find_max_supported_word(
-    word_list, codec, fixed_byte_len)
-# subtract 2 bytes for added safety
-max_char_len -= 2
-safe_word_list = [w for w in word_list if len(w) <= max_char_len]
-
-random_word = random.choice(safe_word_list) + "\0"
-check_audit_viability(random_word, codec, stego_map)
 
 
 def sanitize_string(s):
@@ -2010,127 +2011,490 @@ def sanitize_string(s):
     return "".join(c if c in string.printable and c not in ['\n', '\r'] else '.' for c in s)
 
 
-for i, (cover_tensor, secret_tensor) in pbar:
-    # Prepare single sample
-    secret_text = random.choice(safe_word_list) + "\0"
-    sc = to_scale(to_display(cover_tensor))[tf.newaxis, ...]
-    original_secret_img = to_display(secret_tensor)
+# reload just to check saved model works, and so this can be run without fit if needed.
+for ablation_idx in range(len(ABLATION_CONFIGS)):
+    run_models_dir = os.path.join(models_dir, str(ablation_idx))
+    run_data_dir = os.path.join(data_dir, str(ablation_idx))
+    os.makedirs(os.path.join(run_data_dir, 'visual_results'), exist_ok=True)
+    prep_network, hide_network, reveal_network = load_weights_from_checkpoint(
+        run_models_dir
+    )
 
-    for method in methods:
-        # Dynamic Tool Lookup
-        tool = next((v for k, v in stego_map.items()
-                    if k.lower() == method), None)
+    all_metrics = []
 
-        # --- 1. Embed ---
-        pre_nn_text = ""
-        revealed_text = ""
-        embed_success = True
+    methods = ['original'] + [k.lower() for k in stego_map.keys()]
 
-        if method == 'original' or tool is None:
-            new_secret = original_secret_img
-        else:
-            try:
-                new_secret = tool.embed(
-                    original_secret_img, secret_text, codec
-                )
-                try:
-                    pre_nn_text = tool.extract(new_secret, codec)
-                except:
-                    pre_nn_text = "[Extract Failed]"
-            except Exception as e:
-                embed_success = False
+    num_samples = 5  # len(holdout_dataset)
+    print(f"Evaluating {num_samples} samples...")
+
+    sample_dataset = holdout_dataset.take(num_samples)
+    pbar = tqdm(enumerate(sample_dataset), total=num_samples,
+                desc="Audit Progress", unit="img")
+
+    # Filter for medium-length words to ensure they fit your codec capacity
+    max_word, max_char_len = find_max_supported_word(
+        word_list, codec, fixed_byte_len)
+    # subtract 2 bytes for added safety
+    max_char_len -= 2
+    safe_word_list = [w for w in word_list if len(w) <= max_char_len]
+
+    random_word = random.choice(safe_word_list) + "\0"
+    check_audit_viability(random_word, codec, stego_map)
+
+    for i, (cover_tensor, secret_tensor) in pbar:
+        # Prepare single sample
+        secret_text = random.choice(safe_word_list) + "\0"
+        sc = to_scale(to_display(cover_tensor))[tf.newaxis, ...]
+        original_secret_img = to_display(secret_tensor)
+
+        for method in methods:
+            # Dynamic Tool Lookup
+            tool = next((v for k, v in stego_map.items()
+                        if k.lower() == method), None)
+
+            # --- 1. Embed ---
+            pre_nn_text = ""
+            revealed_text = ""
+            embed_success = True
+
+            if method == 'original' or tool is None:
                 new_secret = original_secret_img
-                pre_nn_text = "[EMBED FAIL]"
-
-        ss = to_scale(new_secret)[tf.newaxis, ...]
-
-        # --- 2. Inference ---
-        p_out = prep_network(ss, training=False)
-        h_out = hide_network([sc, p_out], training=False)
-        r_out = reveal_network(h_out, training=False)
-
-        h_out = tf.cast(h_out, tf.float32)
-        r_out = tf.cast(r_out, tf.float32)
-
-        # --- 3. Extract & Metrics ---
-
-        if method != 'original' and tool is not None:
-            if embed_success:
-                try:
-                    revealed_text = tool.extract(to_display(r_out[0]), codec)
-                except:
-                    revealed_text = "[Extract Failed]"
             else:
-                revealed_text = "[SKIPPED]"
+                try:
+                    new_secret = tool.embed(
+                        original_secret_img, secret_text, codec
+                    )
+                    try:
+                        pre_nn_text = tool.extract(new_secret, codec)
+                    except:
+                        pre_nn_text = "[Extract Failed]"
+                except Exception as e:
+                    embed_success = False
+                    new_secret = original_secret_img
+                    pre_nn_text = "[EMBED FAIL]"
 
-            # Clean and truncate the strings for neat console formatting
-            clean_sec = sanitize_string(secret_text.replace('\0', ''))
-            clean_pre = sanitize_string(pre_nn_text.replace(
-                '\0', '')) if pre_nn_text else "[EMPTY]"
-            clean_rev = sanitize_string(revealed_text.replace('\0', ''))[:15]
+            ss = to_scale(new_secret)[tf.newaxis, ...]
 
+            # --- 2. Inference ---
+            p_out = prep_network(ss, training=False)
+            h_out = hide_network([sc, p_out], training=False)
+            r_out = reveal_network(h_out, training=False)
+
+            h_out = tf.cast(h_out, tf.float32)
+            r_out = tf.cast(r_out, tf.float32)
+
+            # --- 3. Extract & Metrics ---
+
+            if method != 'original' and tool is not None:
+                if embed_success:
+                    try:
+                        revealed_text = tool.extract(
+                            to_display(r_out[0]), codec)
+                    except:
+                        revealed_text = "[Extract Failed]"
+                else:
+                    revealed_text = "[SKIPPED]"
+
+                # Clean and truncate the strings for neat console formatting
+                clean_sec = sanitize_string(secret_text.replace('\0', ''))
+                clean_pre = sanitize_string(pre_nn_text.replace(
+                    '\0', '')) if pre_nn_text else "[EMPTY]"
+                clean_rev = sanitize_string(
+                    revealed_text.replace('\0', ''))[:15]
+
+                # print(
+                #     f"Img {i} | {method:<15} | Sec: '{clean_sec:<12}' | PreNN: '{clean_pre:<15}' | Rev: '{clean_rev:<15}'")
+
+            text_acc = acc_txt(secret_text, revealed_text)
+            ber_text = calculate_text_ber(secret_text, revealed_text)
+            ber_img = calculate_img_ber(ss, r_out)
+
+            # print(
+            #     f"text_acc: {text_acc:.2f}, ber_text: {ber_text:.2f}, ber_img: {ber_img:.2f}")
+            # PSNR/SSIM
+            p_c = tf.image.psnr(sc, h_out, max_val=1.0).numpy()[0]
+            p_s = tf.image.psnr(ss, r_out, max_val=1.0).numpy()[0]
+            s_c = tf.image.ssim(sc, h_out, max_val=1.0).numpy()[0]
+            s_s = tf.image.ssim(ss, r_out, max_val=1.0).numpy()[0]
+
+            t_loss, c_loss, s_loss = steganography_loss(sc, ss, h_out, r_out)
+
+            # --- 4. Periodic Visual Saving ---
+            # Saves every 50th image processed to avoid disk bloat
+            if (i + 1) % 50 == 0:
+                save_visual_comparison(
+                    cover=to_display(sc[0]),
+                    secret=to_display(ss[0]),
+                    stego=to_display(h_out[0]),
+                    reveal=to_display(r_out[0]),
+                    method_name=method,
+                    index=i,
+                    save_dir=os.path.join(run_data_dir, 'visual_results')
+                )
+
+            # --- 5. Data Accumulation ---
+            all_metrics.append({
+                "image_index": i,
+                "method": method,
+                "total_loss": float(t_loss.numpy()),
+                "psnr_c": float(p_c),
+                "ssim_c": float(s_c),
+                "psnr_s": float(p_s),
+                "ssim_s": float(s_s),
+                "ber_img": float(ber_img),
+                "ber_text": float(ber_text),
+                "text_acc": float(text_acc)
+            })
+
+        pbar.set_postfix({"img": i, "last_acc": f"{text_acc:.2f}"})
+
+    # save all_metrics to csv here
+    df_metrics = pd.DataFrame(all_metrics)
+    final_summary_path = os.path.join(run_data_dir, 'evaluation_metrics.csv')
+    df_metrics.to_csv(final_summary_path, index=False)
+    print(f"Metrics saved to {final_summary_path}")
+
+    # --- 2. Final Averaging ---
+    print("\n=== Final Average Evaluation Metrics ===")
+    summary = df_metrics.groupby(
+        'method')[['total_loss', 'psnr_c', 'psnr_s', 'text_acc', 'ber_img', 'ber_text']].mean()
+    print(summary)
+
+    plot_final_summary(all_metrics, os.path.join(
+        run_data_dir, 'final_summary_plot.pdf'))
+
+    del prep_network, hide_network, reveal_network
+    tf.keras.backend.clear_session()
+    gc.collect()
+
+
+# %%
+
+def compare_ablations(ablation_configs, data_dir):
+    """
+    Reads training_history.csv and evaluation_metrics.csv from each
+    ablation run's data directory and prints a ranked comparison table.
+
+    Returns
+    -------
+    df_train  : per-run final-epoch training stats
+    df_holdout: per-run per-method holdout audit stats (averaged)
+    df_rank   : single-row-per-run composite ranking
+    """
+    train_rows = []
+    holdout_rows = []
+
+    for idx, cfg in enumerate(ablation_configs):
+        run_dir = os.path.join(data_dir, str(idx))
+
+        # — Training history (last epoch) —
+        train_path = os.path.join(run_dir, 'training_history.csv')
+        if os.path.exists(train_path):
+            th = pd.read_csv(train_path, index_col='epoch')
+            last = th.iloc[-1]
+            row = {'ablation_idx': idx}
+            row.update({
+                'final_train_loss':    last.get('loss',           float('nan')),
+                'final_val_loss':      last.get('val_loss',        float('nan')),
+                'final_cover_psnr':    last.get('cover_psnr',      float('nan')),
+                'final_val_psnr':      last.get('val_cover_psnr',  float('nan')),
+                'final_secret_ssim':   last.get('secret_ssim',     float('nan')),
+                'final_val_ssim':      last.get('val_secret_ssim', float('nan')),
+                'epochs_trained':      len(th),
+            })
+            # Capture config fields for display
+            row.update({k: v for k, v in cfg.items()})
+            train_rows.append(row)
+        else:
             print(
-                f"Img {i} | {method:<15} | Sec: '{clean_sec:<12}' | PreNN: '{clean_pre:<15}' | Rev: '{clean_rev:<15}'")
+                f"[warn] No training_history.csv for ablation {idx} — skipping")
 
-        text_acc = acc_txt(secret_text, revealed_text)
-        ber_text = calculate_text_ber(secret_text, revealed_text)
-        ber_img = calculate_img_ber(ss, r_out)
+        # — Holdout evaluation metrics (mean across images, per method) —
+        eval_path = os.path.join(run_dir, 'evaluation_metrics.csv')
+        if os.path.exists(eval_path):
+            em = pd.read_csv(eval_path)
+            em['ablation_idx'] = idx
+            holdout_rows.append(em)
 
-        print(
-            f"text_acc: {text_acc:.2f}, ber_text: {ber_text:.2f}, ber_img: {ber_img:.2f}")
-        # PSNR/SSIM
-        p_c = tf.image.psnr(sc, h_out, max_val=1.0).numpy()[0]
-        p_s = tf.image.psnr(ss, r_out, max_val=1.0).numpy()[0]
-        s_c = tf.image.ssim(sc, h_out, max_val=1.0).numpy()[0]
-        s_s = tf.image.ssim(ss, r_out, max_val=1.0).numpy()[0]
+    if not train_rows:
+        print("No ablation data found — have you run the training and holdout loops yet?")
+        return None, None, None
 
-        t_loss, c_loss, s_loss = steganography_loss(sc, ss, h_out, r_out)
+    df_train = pd.DataFrame(train_rows).set_index('ablation_idx')
 
-        # --- 4. Periodic Visual Saving ---
-        # Saves every 50th image processed to avoid disk bloat
-        # if (i + 1) % 50 == 0:
-        save_visual_comparison(
-            cover=to_display(sc[0]),
-            secret=to_display(ss[0]),
-            stego=to_display(h_out[0]),
-            reveal=to_display(r_out[0]),
-            method_name=method,
-            index=i,
-            save_dir=os.path.join(data_dir, "visual_results")
+    # — Holdout aggregation (exclude 'original' for text metrics) —
+    if holdout_rows:
+        df_hold_all = pd.concat(holdout_rows, ignore_index=True)
+        # Network-level: mean over all methods including original
+        net_agg = (
+            df_hold_all
+            .groupby('ablation_idx')[['psnr_c', 'ssim_c', 'psnr_s', 'ssim_s', 'total_loss']]
+            .mean()
+            .rename(columns={
+                'psnr_c':     'holdout_psnr_cover',
+                'ssim_c':     'holdout_ssim_cover',
+                'psnr_s':     'holdout_psnr_secret',
+                'ssim_s':     'holdout_ssim_secret',
+                'total_loss': 'holdout_total_loss',
+            })
         )
+        # Text recovery: mean over non-original methods only
+        text_agg = (
+            df_hold_all[df_hold_all['method'] != 'original']
+            .groupby('ablation_idx')[['text_acc', 'ber_text', 'ber_img']]
+            .mean()
+            .rename(columns={
+                'text_acc':  'holdout_text_acc',
+                'ber_text':  'holdout_ber_text',
+                'ber_img':   'holdout_ber_img',
+            })
+        )
+        df_holdout = net_agg.join(text_agg)
+    else:
+        df_holdout = pd.DataFrame()
 
-        # --- 5. Data Accumulation ---
-        all_metrics.append({
-            "image_index": i,
-            "method": method,
-            "total_loss": float(t_loss.numpy()),
-            "psnr_c": float(p_c),
-            "ssim_c": float(s_c),
-            "psnr_s": float(p_s),
-            "ssim_s": float(s_s),
-            "ber_img": float(ber_img),
-            "ber_text": float(ber_text),
-            "text_acc": float(text_acc)
-        })
+    # — Composite ranking —
+    df_rank = df_train[['BETA', 'ALPHA', 'LEARNING_RATE', 'START_NOISE_EP',
+                        'RS_BYTES', 'final_val_loss', 'final_val_psnr',
+                        'final_val_ssim']].copy()
+    if not df_holdout.empty:
+        df_rank = df_rank.join(df_holdout[['holdout_psnr_cover', 'holdout_ssim_cover',
+                                           'holdout_text_acc',   'holdout_ber_text']])
 
-    pbar.set_postfix({"img": i, "last_acc": f"{text_acc:.2f}"})
+    # Higher = better for PSNR/SSIM/text_acc; lower = better for loss/BER.
+    # Rank each metric (1 = best) then average for a composite score.
+    rank_cols = {}
+    for col, ascending in [
+        ('final_val_loss',      True),
+        ('final_val_psnr',      False),
+        ('final_val_ssim',      False),
+        ('holdout_psnr_cover',  False),
+        ('holdout_ssim_cover',  False),
+        ('holdout_text_acc',    False),
+        ('holdout_ber_text',    True),
+    ]:
+        if col in df_rank.columns:
+            rank_cols[col] = df_rank[col].rank(
+                ascending=ascending, na_option='bottom')
+
+    if rank_cols:
+        df_rank['composite_rank_score'] = pd.DataFrame(rank_cols).mean(axis=1)
+        df_rank = df_rank.sort_values('composite_rank_score')
+
+    # — Display —
+    print("\n" + "=" * 72)
+    print("ABLATION COMPARISON — Training (final epoch)")
+    print("=" * 72)
+    display(df_train[['BETA', 'ALPHA', 'LEARNING_RATE', 'RS_BYTES',
+                      'START_NOISE_EP', 'epochs_trained',
+                      'final_val_loss', 'final_val_psnr', 'final_val_ssim']]
+            .round(4))
+
+    if not df_holdout.empty:
+        print("\n" + "=" * 72)
+        print("ABLATION COMPARISON — Holdout Audit (averaged across images & methods)")
+        print("=" * 72)
+        display(df_holdout.round(4))
+
+    print("\n" + "=" * 72)
+    print("COMPOSITE RANKING  (lower composite_rank_score = better overall)")
+    print("=" * 72)
+    display(df_rank.round(4))
+
+    best = df_rank.index[0]
+    print(f"\n✅ Best overall ablation: idx {best}  — {ablation_configs[best]}")
+
+    return df_train, df_holdout, df_rank
 
 
-# save all_metrics to csv here
-df_metrics = pd.DataFrame(all_metrics)
-final_summary_path = os.path.join(data_dir, "evaluation_metrics.csv")
-df_metrics.to_csv(final_summary_path, index=False)
-print(f"Metrics saved to {final_summary_path}")
+def plot_ablation_comparison(df_train, df_holdout, df_rank, ablation_configs, save_path=None):
+    """
+    2×2 Plotly figure comparing ablations across the four most diagnostic axes:
+      Panel 1 (top-left)  — Cover quality:   val PSNR  + holdout PSNR cover
+      Panel 2 (top-right) — Secret quality:  val SSIM  + holdout SSIM secret
+      Panel 3 (bot-left)  — Text recovery:   holdout text accuracy + BER text
+      Panel 4 (bot-right) — Composite rank score (lower = better)
 
-# --- 2. Final Averaging ---
-print("\n=== Final Average Evaluation Metrics ===")
-summary = df_metrics.groupby(
-    'method')[['total_loss', 'psnr_c', 'psnr_s', 'text_acc', 'ber_img', 'ber_text']].mean()
-print(summary)
+    Each ablation is labelled with its key config params for easy identification.
+    """
+    if df_train is None:
+        print("No ablation data to plot.")
+        return
 
-plot_final_summary(all_metrics, os.path.join(
-    data_dir, "final_summary_plot.pdf"))
+    # Build short labels: "β=5 α=1 LR=1e-3 RS=32 N@25"
+    labels = []
+    for i, cfg in enumerate(ablation_configs):
+        lr_str = f"{cfg['LEARNING_RATE']:.0e}"
+        n_str = "no-noise" if cfg['START_NOISE_EP'] >= 999 else f"N@{cfg['START_NOISE_EP']}"
+        labels.append(
+            f"[{i}] β={cfg['BETA']} α={cfg['ALPHA']} LR={lr_str} RS={cfg['RS_BYTES']} {n_str}")
 
+    idx_list = list(range(len(ablation_configs)))
+
+    # Colour palette — one colour per ablation, consistent across panels
+    palette = [
+        '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b',
+        '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
+    ]
+    colors = [palette[i % len(palette)] for i in idx_list]
+
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=(
+            "Cover Quality  (PSNR — higher is better)",
+            "Secret Recovery Quality  (SSIM — higher is better)",
+            "Text Recovery  (Accuracy ↑  |  BER ↓)",
+            "Composite Rank Score  (lower = better overall)",
+        ),
+        horizontal_spacing=0.12,
+        vertical_spacing=0.18,
+        specs=[
+            [{"secondary_y": False}, {"secondary_y": False}],
+            [{"secondary_y": True},  {"secondary_y": False}],
+        ],
+    )
+
+    # ── Panel 1: PSNR (cover) ─────────────────────────────────────────────
+    # Val PSNR from training history
+    if 'final_val_psnr' in df_train.columns:
+        fig.add_trace(go.Bar(
+            x=labels,
+            y=[df_train.loc[i, 'final_val_psnr'] if i in df_train.index else float('nan')
+               for i in idx_list],
+            name="Val PSNR (train)",
+            marker_color=colors,
+            opacity=0.6,
+            showlegend=True,
+        ), row=1, col=1)
+
+    # Holdout PSNR cover
+    if df_holdout is not None and 'holdout_psnr_cover' in df_holdout.columns:
+        fig.add_trace(go.Scatter(
+            x=labels,
+            y=[df_holdout.loc[i, 'holdout_psnr_cover'] if i in df_holdout.index else float('nan')
+               for i in idx_list],
+            name="Holdout PSNR cover",
+            mode='markers+lines',
+            marker=dict(size=10, symbol='diamond', color=colors,
+                        line=dict(width=1, color='black')),
+            line=dict(color='black', width=1, dash='dot'),
+        ), row=1, col=1)
+
+    # ── Panel 2: SSIM (secret) ────────────────────────────────────────────
+    if 'final_val_ssim' in df_train.columns:
+        fig.add_trace(go.Bar(
+            x=labels,
+            y=[df_train.loc[i, 'final_val_ssim'] if i in df_train.index else float('nan')
+               for i in idx_list],
+            name="Val SSIM (train)",
+            marker_color=colors,
+            opacity=0.6,
+            showlegend=True,
+        ), row=1, col=2)
+
+    if df_holdout is not None and 'holdout_ssim_secret' in df_holdout.columns:
+        fig.add_trace(go.Scatter(
+            x=labels,
+            y=[df_holdout.loc[i, 'holdout_ssim_secret'] if i in df_holdout.index else float('nan')
+               for i in idx_list],
+            name="Holdout SSIM secret",
+            mode='markers+lines',
+            marker=dict(size=10, symbol='diamond', color=colors,
+                        line=dict(width=1, color='black')),
+            line=dict(color='black', width=1, dash='dot'),
+        ), row=1, col=2)
+
+    # ── Panel 3: Text accuracy (primary) + BER text (secondary) ──────────
+    if df_holdout is not None and 'holdout_text_acc' in df_holdout.columns:
+        fig.add_trace(go.Bar(
+            x=labels,
+            y=[df_holdout.loc[i, 'holdout_text_acc'] if i in df_holdout.index else float('nan')
+               for i in idx_list],
+            name="Text Accuracy",
+            marker_color=colors,
+            opacity=0.75,
+        ), row=2, col=1, secondary_y=False)
+
+    if df_holdout is not None and 'holdout_ber_text' in df_holdout.columns:
+        fig.add_trace(go.Scatter(
+            x=labels,
+            y=[df_holdout.loc[i, 'holdout_ber_text'] if i in df_holdout.index else float('nan')
+               for i in idx_list],
+            name="BER Text (lower = better)",
+            mode='markers+lines',
+            marker=dict(size=9, color=colors,
+                        line=dict(width=1, color='black')),
+            line=dict(color='crimson', width=2, dash='dash'),
+        ), row=2, col=1, secondary_y=True)
+
+    # ── Panel 4: Composite rank score ─────────────────────────────────────
+    if df_rank is not None and 'composite_rank_score' in df_rank.columns:
+        scores = [df_rank.loc[i, 'composite_rank_score'] if i in df_rank.index else float('nan')
+                  for i in idx_list]
+        fig.add_trace(go.Bar(
+            x=labels,
+            y=scores,
+            name="Composite rank score",
+            marker_color=colors,
+            opacity=0.85,
+            showlegend=False,
+        ), row=2, col=2)
+        # Annotate the winner
+        best_i = int(df_rank.index[0])
+        if best_i < len(labels):
+            fig.add_annotation(
+                x=labels[best_i], y=scores[best_i],
+                text="★ Best",
+                showarrow=True, arrowhead=2, yshift=12,
+                font=dict(color='green', size=12),
+                row=2, col=2,
+            )
+
+    # ── Axis labels ───────────────────────────────────────────────────────
+    fig.update_yaxes(title_text="PSNR (dB)", row=1, col=1)
+    fig.update_yaxes(title_text="SSIM (0–1)", range=[0, 1.05], row=1, col=2)
+    fig.update_yaxes(title_text="Text Accuracy (0–1)", range=[0, 1.05],
+                     row=2, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="BER Text (0–1)", range=[0, 1.05],
+                     row=2, col=1, secondary_y=True)
+    fig.update_yaxes(title_text="Avg Rank (lower = better)", row=2, col=2)
+
+    for row, col in [(1, 1), (1, 2), (2, 1), (2, 2)]:
+        fig.update_xaxes(tickangle=-35, tickfont=dict(size=9),
+                         row=row, col=col)
+
+    fig.update_layout(
+        height=800, width=1600,
+        title_text="Ablation Study: Cover Quality · Secret Recovery · Text Accuracy · Composite Rank",
+        template="plotly_white",
+        barmode="group",
+        legend=dict(orientation="h", yanchor="bottom",
+                    y=1.02, xanchor="right", x=1),
+    )
+
+    if save_path:
+        fig.write_image(save_path, format="pdf", width=1600, height=800)
+        print(f"Ablation comparison plot saved to {save_path}")
+    fig.show()
+
+
+df_abl_train, df_abl_holdout, df_abl_rank = compare_ablations(
+    ABLATION_CONFIGS, data_dir)
+
+
+if df_abl_rank is not None:
+    plot_ablation_comparison(
+        df_abl_train, df_abl_holdout, df_abl_rank,
+        ABLATION_CONFIGS,
+        save_path=os.path.join(data_dir, "ablation_comparison.pdf"),
+    )
+
+
+# %% [markdown]
+# ### Final testing for steg methods
+#
+# once best ablation has been determined, should speed up dev to then use below on that one, instead of needing to run on each...
+#
 
 # %%
 
